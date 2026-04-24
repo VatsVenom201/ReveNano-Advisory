@@ -114,8 +114,9 @@ def chat(chat_input: ChatInput, db: Session = Depends(get_db)):
 
     "6. CONFIDENCE LEVEL\n"
     "State confidence (Low/Medium/High) with a short reason."
+    
     "Do NOT repeat any section. Avoid duplicate explanations. Keep response concise and structured."
-    "reply in the language that user used, if in gujarati then reply in gujarati with same meaning. "
+    "Only reply in the language that user used to ask the query. Keep language simple"
 
     )
 
