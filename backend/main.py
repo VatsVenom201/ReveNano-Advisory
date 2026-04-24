@@ -139,7 +139,7 @@ def chat(chat_input: ChatInput, db: Session = Depends(get_db)):
         )
         
         try:
-            bot_reply = response.output[0].content[0].text
+            bot_reply = response.output_text
             usage = response.usage
             print(f"Usage for this query: \n{usage}\n")
         except (AttributeError, IndexError):
