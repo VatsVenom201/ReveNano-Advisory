@@ -29,6 +29,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
 # Pydantic Schemas
 class MessageSchema(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -46,6 +50,8 @@ class ChatInput(BaseModel):
     user_id: int
     thread_id: Optional[int] = None
     message: str
+    file_path: Optional[str] = None
+    image_b64: Optional[str] = None
 
 class ChatResponse(BaseModel):
     reply: Optional[str] = None
@@ -91,34 +97,63 @@ def chat(chat_input: ChatInput, db: Session = Depends(get_db)):
     
     previous_id = last_assistant_msg.response_id if last_assistant_msg else None
     
-    # 4. Call OpenAI Responses API
+    # 4. Consolidate Instructions for Multimodal Agricultural Advisor
     instructions = (
-            "You are a professional agricultural advisor. Provide clear, actionable, and scientific advice to farmers. "
-    "Understand the user's query and respond with practical, field-applicable guidance. "
-    "Keep explanations simple but accurate.\n\n"
-
-    "1. UNDERSTANDING THE PROBLEM\n"
-    "Explain the user’s issue clearly.\n\n"
-
-    "2. POSSIBLE CAUSES / INSIGHTS\n"
-    "List likely scientific or environmental causes.\n\n"
-
-    "3. RECOMMENDED ACTIONS\n"
-    "Provide clear step-by-step solutions.\n\n"
-
-    "4. RISKS / PRECAUTIONS\n"
-    "Mention risks and what to avoid.\n\n"
-
-    "5. NEXT STEPS / MONITORING\n"
-    "Explain how to track progress or improvements.\n\n"
-
-    "6. CONFIDENCE LEVEL\n"
-    "State confidence (Low/Medium/High) with a short reason."
-    
-    "Do NOT repeat any section. Avoid duplicate explanations. Keep response concise and structured."
-    "Only reply in the language that user used to ask the query. Keep language simple"
-
+        "You are a professional agricultural advisor. Provide clear, actionable, and scientific advice to farmers. "
+        "Understand the user's query and respond with practical, field-applicable guidance based on any provided text, documents, or images. "
+        "Keep explanations simple but accurate.\n\n"
+        "1. UNDERSTANDING THE PROBLEM\n"
+        "Explain the user’s issue clearly.\n\n"
+        "2. POSSIBLE CAUSES / INSIGHTS\n"
+        "List likely scientific or environmental causes.\n\n"
+        "3. RECOMMENDED ACTIONS\n"
+        "Provide clear step-by-step solutions.\n\n"
+        "4. RISKS / PRECAUTIONS\n"
+        "Mention risks and what to avoid.\n\n"
+        "5. NEXT STEPS / MONITORING\n"
+        "Explain how to track progress or improvements.\n\n"
+        "6. CONFIDENCE LEVEL\n"
+        "State confidence (Low/Medium/High) with a short reason.\n"
+        "Do NOT repeat any section. Avoid duplicate explanations. Keep response concise and structured.\n"
+        "Only reply in the language that user used to ask the query. Keep language simple."
     )
+
+    # 5. Handle Document Upload (with Duplicate Check)
+    file_id = None
+    if chat_input.file_path and os.path.exists(chat_input.file_path):
+        file_name = os.path.basename(chat_input.file_path)
+        file_size = os.path.getsize(chat_input.file_path)
+        
+        # Check OpenAI for existing file
+        existing_files = client.files.list(purpose="user_data")
+        for file in existing_files.data:
+            if file.filename == file_name and file.bytes == file_size:
+                file_id = file.id
+                break
+        
+        # Upload if not found
+        if not file_id:
+            with open(chat_input.file_path, "rb") as f:
+                uploaded_file = client.files.create(file=f, purpose="user_data")
+            file_id = uploaded_file.id
+
+    # 6. Construct OpenAI Input
+    openai_input_content = []
+    
+    # Add text message
+    openai_input_content.append({"type": "input_text", "text": chat_input.message})
+    
+    # Add document if provided
+    if file_id:
+        openai_input_content.append({"type": "input_file", "file_id": file_id})
+    
+    # Add image if provided
+    if chat_input.image_b64:
+        # Ensure it has the proper prefix
+        image_url = chat_input.image_b64
+        if not image_url.startswith("data:image"):
+            image_url = f"data:image/jpeg;base64,{image_url}"
+        openai_input_content.append({"type": "input_image", "image_url": image_url})
 
     error_msg = None
     bot_reply = None
@@ -129,12 +164,12 @@ def chat(chat_input: ChatInput, db: Session = Depends(get_db)):
             model="gpt-4.1-mini",
             instructions=instructions,
             previous_response_id=previous_id,
+            temperature=0.8,
+            max_output_tokens=800,
             input=[
                 {
                     "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": chat_input.message}
-                    ]
+                    "content": openai_input_content
                 }
             ]
         )
