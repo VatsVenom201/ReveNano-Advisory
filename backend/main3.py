@@ -1,6 +1,7 @@
 import os
 import datetime
 import json
+import time
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Depends
@@ -38,6 +39,25 @@ app.add_middleware(
 
 MASTER_VECTOR_STORE_NAME = "Unified_Agriculture_RAG"
 MASTER_VECTOR_STORE_ID = None
+
+AGRI_ADVISOR_INSTRUCTIONS = (
+    """You are an expert agricultural advisory assistant for farmers. Provide practical, scientifically sound, field-applicable guidance using the user query and any retrieved text, documents, or images.
+
+    Internally reason through (do not reveal): understand the problem, assess likely causes, choose actions, consider risks, suggest follow-up, estimate confidence. Use this only to improve answer quality; never output these steps.
+
+    Response rules:
+    - Give a direct answer first.
+    - Then provide short pointwise guidance only if needed (3–5 bullets max).
+    - Keep responses concise, actionable, and easy for farmers to understand.
+    - Prioritize recommendations over long explanations.
+    - Avoid repetition, textbook-style responses, and unnecessary disclaimers.
+    - For simple factual questions, answer in 2–5 lines only.
+    - For diagnosis/problem queries, cover likely cause, recommended action, and key precaution briefly.
+    - If information is insufficient, ask a short clarifying question instead of guessing.
+    - Important: Multiple reports/documents may be provided. For each piece of information, pay close attention to the `[Source: filename]` tag to distinguish between different farms, plots, or soil tests.
+    - Use retrieved knowledge when relevant, but synthesize it into advice rather than quoting documents.
+    - Reply only in the same language as the user."""
+)
 
 SEED_FILES = [
     {
@@ -175,19 +195,49 @@ def add_uploaded_file_to_store(file_path):
             vector_store_id=MASTER_VECTOR_STORE_ID,
             file_ids=[file_id]
         )
-        print(f"Ingestion complete for {file_id}")
-
+        
         try:
-            # Create a dynamic attribute set that includes the filename
-            file_specific_attributes = SOIL_REPORT_ATTRIBUTES.copy()
-            file_specific_attributes["content_description"] = f"Soil report: {file_name}"
-
+            # Update attributes for manual filtering search
+            # We must include the filename in the description to match what the retriever looks for
+            file_attributes = SOIL_REPORT_ATTRIBUTES.copy()
+            file_attributes["content_description"] = f"Soil report: {file_name}"
+            
             client.vector_stores.files.update(
                 vector_store_id=MASTER_VECTOR_STORE_ID,
                 file_id=file_id,
-                attributes=file_specific_attributes
+                attributes=file_attributes
             )
             print(f"Successfully updated attributes for {file_id} (Source: {file_name})")
+            
+            # PROACTIVE POLLING: Wait until the file is actually searchable with its new metadata
+            print(f"DEBUG: Waiting for {file_id} ({file_name}) to become searchable...")
+            search_ready = False
+            for i in range(15): # Max 30 seconds
+                try:
+                    test_results = client.vector_stores.search(
+                        vector_store_id=MASTER_VECTOR_STORE_ID,
+                        query=file_name, # Use filename as query to ensure high relevance
+                        filters={
+                            "key": "content_description",
+                            "type": "eq",
+                            "value": f"Soil report: {file_name}"
+                        }
+                    )
+                    if hasattr(test_results, "data") and len(test_results.data) > 0:
+                        print(f"DEBUG: File {file_id} is now searchable! (Attempt {i+1})")
+                        search_ready = True
+                        break
+                except Exception as ex:
+                    print(f"DEBUG: Search poll error: {ex}")
+                
+                print(f"DEBUG: Still waiting for indexing... (Attempt {i+1}/15)")
+                time.sleep(2)
+            
+            if not search_ready:
+                print(f"WARNING: File {file_id} did not become searchable within timeout. Proceeding anyway.")
+
+            refresh_file_map()
+            print(f"Ingestion complete for {file_id}")
         except Exception as e:
             print(f"Attribute update warning: {e}")
 
@@ -205,7 +255,8 @@ FILE_ID_MAP = {} # Cache for file_id -> filename
 def refresh_file_map():
     global FILE_ID_MAP
     try:
-        files = client.files.list(purpose="user_data")
+        # Remove purpose="user_data" to include ALL files (seed files are purpose="assistants")
+        files = client.files.list()
         for f in files.data:
             FILE_ID_MAP[f.id] = f.filename
     except Exception as e:
@@ -256,6 +307,7 @@ def infer_metadata_filter(query: str):
         "ph value",
         "my nutrient",
         "this soil",
+        "report"
     ]
 
     if any(k in q_norm for k in personal_keywords):
@@ -326,7 +378,7 @@ def retrieve_context(user_query: str):
                     "type": "eq",
                     "value": f"Soil report: {fname}"
                 },
-                "limit": 4
+                "limit": 10
             })
     else:
         # Fallback to general filters if no specific files named
@@ -335,7 +387,7 @@ def retrieve_context(user_query: str):
         search_tasks.append({
             "label": "General Search (Personal/Agri)",
             "filter": filt,
-            "limit": 5
+            "limit": 10
         })
 
     # Step 3: Execute searches and combine
@@ -343,7 +395,7 @@ def retrieve_context(user_query: str):
     
     for task in search_tasks:
         try:
-            print(f"DEBUG: Executing {task['label']} (Limit: {task['limit']})...")
+            print(f"DEBUG: Executing {task['label']} (Initial Retrieval Limit: {task['limit']})...")
             results = client.vector_stores.search(
                 vector_store_id=MASTER_VECTOR_STORE_ID,
                 query=user_query,
@@ -351,18 +403,32 @@ def retrieve_context(user_query: str):
             )
             
             if hasattr(results, "data"):
-                file_hit_count = len(results.data)
-                print(f"DEBUG: Found {file_hit_count} chunks for {task['label']}")
+                raw_chunks = results.data
+                print(f"DEBUG: Found {len(raw_chunks)} raw chunks for {task['label']}")
                 
-                for i, r in enumerate(results.data[:task["limit"]]):
+                # --- RERANKING & FILTERING ---
+                # We skip the thresholding step to avoid missing potentially relevant data 
+                # that might have a lower score than "garbage" chunks.
+                # Results are already pre-sorted by score from the vector store.
+                reranked_chunks = list(raw_chunks)
+                
+                # Sort descending by score (explicit sort)
+                reranked_chunks.sort(key=lambda x: getattr(x, "score", 0.0), reverse=True)
+                
+                # 3. Take Top 5 for this file/task
+                final_file_chunks = reranked_chunks[:5]
+                print(f"DEBUG: Retrieval complete. {len(final_file_chunks)} chunks accepted for {task['label']}")
+                
+                for i, r in enumerate(final_file_chunks):
                     file_id = getattr(r, "file_id", "unknown")
                     source_name = FILE_ID_MAP.get(file_id, "Unknown Source")
+                    score = getattr(r, "score", 0.0)
                     
                     if hasattr(r, "content"):
                         chunk_text = r.content[0].text
-                        # Show preview in terminal (approx 200 words)
-                        preview = " ".join(chunk_text.split()[:200])
-                        print(f"--- Chunk {i+1} [Source: {source_name}] ---\n{preview}...\n")
+                        # Show preview in terminal
+                        preview = " ".join(chunk_text.split()[:50])
+                        print(f"--- Chunk {i+1} [Source: {source_name}] [Score: {score:.4f}] ---\n{preview}...\n")
                         
                         all_chunks.append(f"[Source: {source_name}]\n{chunk_text}")
         except Exception as e:
@@ -414,7 +480,7 @@ class ChatInput(BaseModel):
     user_id: int
     thread_id: Optional[int] = None
     message: str
-    file_path: Optional[str] = None
+    file_paths: List[str] = [] # Changed from file_path to file_paths
     image_b64: Optional[str] = None
     system_prompt: Optional[str] = None
 
@@ -512,39 +578,24 @@ def chat(
     )
 
 
-    DEFAULT_INSTRUCTIONS = (
-        """You are an expert agricultural advisory assistant for farmers. Provide practical, scientifically sound, field-applicable guidance using the user query and any retrieved text, documents, or images.
-
-        Internally reason through (do not reveal): understand the problem, assess likely causes, choose actions, consider risks, suggest follow-up, estimate confidence. Use this only to improve answer quality; never output these steps.
-
-        Response rules:
-        - Give a direct answer first.
-        - Then provide short pointwise guidance only if needed (3–5 bullets max).
-        - Keep responses concise, actionable, and easy for farmers to understand.
-        - Prioritize recommendations over long explanations.
-        - Avoid repetition, textbook-style responses, and unnecessary disclaimers.
-        - For simple factual questions, answer in 2–5 lines only.
-        - For diagnosis/problem queries, cover likely cause, recommended action, and key precaution briefly.
-        - If information is insufficient, ask a short clarifying question instead of guessing.
-        - Important: Multiple reports/documents may be provided. For each piece of information, pay close attention to the `[Source: filename]` tag to distinguish between different farms, plots, or soil tests.
-        - Use retrieved knowledge when relevant, but synthesize it into advice rather than quoting documents.
-        - Reply only in the same language as the user."""
-    )
-
-    instructions = chat_input.system_prompt or DEFAULT_INSTRUCTIONS
+    # -------------------------
+    # Construct Payload
+    # -------------------------
+    
+    # Base instructions are permanent. User prompt is appended if provided.
+    # 4. Consolidate Instructions
+    # If a system_prompt is provided from the UI, it replaces the default AGRI_ADVISOR_INSTRUCTIONS entirely.
+    instructions = chat_input.system_prompt or AGRI_ADVISOR_INSTRUCTIONS
 
 
     # -------------------------
-    # Handle upload
+    # Handle multiple file uploads
     # -------------------------
-
-    if (
-        chat_input.file_path
-        and os.path.exists(chat_input.file_path)
-    ):
-        add_uploaded_file_to_store(
-            chat_input.file_path
-        )
+    if chat_input.file_paths:
+        for f_path in chat_input.file_paths:
+            if os.path.exists(f_path):
+                print(f"DEBUG: Processing upload: {f_path}")
+                add_uploaded_file_to_store(f_path)
 
 
     # -------------------------
@@ -626,7 +677,9 @@ New User Query:
     response_id = None
     error_msg = None
 
-
+########################################################################################################
+#                         MODEL IMPLEMENTATION
+########################################################################################################
     try:
         response = client.responses.create(
             model="gpt-4.1-mini",

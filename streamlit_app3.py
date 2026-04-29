@@ -19,6 +19,23 @@ st.set_page_config(
     layout="centered"
 )
 
+CORE_PERSONA = """You are an expert agricultural advisory assistant for farmers. Provide practical, scientifically sound, field-applicable guidance using the user query and any retrieved text, documents, or images.
+
+Internally reason through (do not reveal): understand the problem, assess likely causes, choose actions, consider risks, suggest follow-up, estimate confidence. Use this only to improve answer quality; never output these steps.
+
+Response rules:
+- Give a direct answer first.
+- Then provide short pointwise guidance only if needed (3–5 bullets max).
+- Keep responses concise, actionable, and easy for farmers to understand.
+- Prioritize recommendations over long explanations.
+- Avoid repetition, textbook-style responses, and unnecessary disclaimers.
+- For simple factual questions, answer in 2–5 lines only.
+- For diagnosis/problem queries, cover likely cause, recommended action, and key precaution briefly.
+- If information is insufficient, ask a short clarifying question instead of guessing.
+- Important: Multiple reports/documents may be provided. For each piece of information, pay close attention to the `[Source: filename]` tag to distinguish between different farms, plots, or soil tests.
+- Use retrieved knowledge when relevant, but synthesize it into advice rather than quoting documents.
+- Reply only in the same language as the user."""
+
 # --- STYLES (from app2 pattern) ---
 st.markdown("""
     <style>
@@ -39,23 +56,14 @@ if "messages" not in st.session_state:
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = None
 if "system_prompt" not in st.session_state:
-    st.session_state.system_prompt = (
-        "You are an expert agricultural advisory assistant for farmers. Provide practical, scientifically sound, field-applicable guidance using the user query and any retrieved text, documents, or images.\n\n"
-        "Response rules:\n"
-        "- Give a direct answer first.\n"
-        "- Then provide short pointwise guidance only if needed (3–5 bullets max).\n"
-        "- Keep responses concise, actionable, and easy for farmers to understand.\n"
-        "- Prioritize recommendations over long explanations.\n"
-        "- Avoid repetition, textbook-style responses, and unnecessary disclaimers.\n"
-        "- For simple factual questions, answer in 2–5 lines only.\n"
-        "- For diagnosis/problem queries, cover likely cause, recommended action, and key precaution briefly.\n"
-        "- If information is insufficient, ask a short clarifying question instead of guessing.\n"
-        "- Important: Multiple reports/documents may be provided. For each piece of information, pay close attention to the [Source: filename] tag to distinguish between different farms, plots, or soil tests.\n"
-        "- Use retrieved knowledge when relevant, but synthesize it into advice rather than quoting documents.\n"
-        "- Reply only in the same language as the user."
-    )
+    st.session_state.system_prompt = CORE_PERSONA # Pre-fill with the default persona
 
 # --- HELPERS ---
+
+def clear_chat():
+    st.session_state.messages = []
+    st.session_state.thread_id = None
+    st.rerun()
 
 def check_backend():
     try:
@@ -79,36 +87,30 @@ def load_thread(thread_id):
 
     st.rerun()
 
+    st.rerun()
+
 @st.dialog("⚙️ AI Customization", width="large")
 def show_settings():
-    st.subheader("System Instructions")
-    st.info("Customize how the AI Advisor behaves. These rules are sent with every message.")
+    st.subheader("System Prompt Editor")
+    
+    st.info("The text below is the complete set of instructions given to the AI. You can modify it or replace it entirely.")
+    
+    with st.expander("📖 View Original Default Persona (for reference)", expanded=False):
+        st.markdown(f"```text\n{CORE_PERSONA}\n```")
+    
     new_prompt = st.text_area(
-        "Advisor Personality & Rules:",
+        "Current System Instructions:",
         value=st.session_state.system_prompt,
-        height=450,
-        help="Edit the core prompt. Changes apply to the next message."
+        height=400,
+        placeholder="Enter the full AI persona instructions here...",
+        help="This entire text will be sent to the AI as its system instructions."
     )
     if new_prompt != st.session_state.system_prompt:
         st.session_state.system_prompt = new_prompt
-        st.toast("System prompt updated!")
+        st.toast("System prompt saved!")
         
-    if st.button("🔄 Reset to Default"):
-        st.session_state.system_prompt = (
-            "You are an expert agricultural advisory assistant for farmers. Provide practical, scientifically sound, field-applicable guidance using the user query and any retrieved text, documents, or images.\n\n"
-            "Response rules:\n"
-            "- Give a direct answer first.\n"
-            "- Then provide short pointwise guidance only if needed (3–5 bullets max).\n"
-            "- Keep responses concise, actionable, and easy for farmers to understand.\n"
-            "- Prioritize recommendations over long explanations.\n"
-            "- Avoid repetition, textbook-style responses, and unnecessary disclaimers.\n"
-            "- For simple factual questions, answer in 2–5 lines only.\n"
-            "- For diagnosis/problem queries, cover likely cause, recommended action, and key precaution briefly.\n"
-            "- If information is insufficient, ask a short clarifying question instead of guessing.\n"
-            "- Important: Multiple reports/documents may be provided. For each piece of information, pay close attention to the [Source: filename] tag to distinguish between different farms, plots, or soil tests.\n"
-            "- Use retrieved knowledge when relevant, but synthesize it into advice rather than quoting documents.\n"
-            "- Reply only in the same language as the user."
-        )
+    if st.button("🔄 Reset to Default Persona"):
+        st.session_state.system_prompt = CORE_PERSONA
         st.rerun()
 
 # --- SIDEBAR (from app2 design) ---
@@ -127,13 +129,18 @@ with st.sidebar:
     
     st.divider()
     st.subheader("📎 Attachments")
-    uploaded_file = st.file_uploader(
-        "Upload report or image",
+    uploaded_files = st.file_uploader(
+        "Upload reports (PDF/TXT) or images (JPG/PNG)",
         type=["pdf", "docx", "txt", "jpg", "jpeg", "png"],
-        help="Upload files for context-aware advice."
+        accept_multiple_files=True,
+        help="Upload multiple files for context-aware advice."
     )
-    if uploaded_file:
-        st.info(f"Selected: {uploaded_file.name}")
+    if uploaded_files:
+        st.info(f"📁 {len(uploaded_files)} files selected")
+        for f in uploaded_files:
+            # Preview if image
+            if f.type.startswith("image/"):
+                st.image(f, caption=f"Preview: {f.name}", use_container_width=True)
 
     st.divider()
     st.subheader("📚 Chat History")
@@ -177,18 +184,20 @@ if prompt := st.chat_input("Ask about crops, soil, or pests..."):
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Process attachment
-    file_path = None
+    # Process attachments
+    file_paths = []
     image_b64 = None
-    if uploaded_file:
-        file_bytes = uploaded_file.read()
-        if uploaded_file.type.startswith("image/"):
-            image_b64 = base64.b64encode(file_bytes).decode('utf-8')
-        else:
-            file_path = os.path.join(TEMP_DIR, uploaded_file.name)
-            with open(file_path, "wb") as f:
-                f.write(file_bytes)
-            file_path = os.path.abspath(file_path)
+    if uploaded_files:
+        for f in uploaded_files:
+            file_bytes = f.read()
+            if f.type.startswith("image/"):
+                # Use only the first image for visual intent for now, or last
+                image_b64 = base64.b64encode(file_bytes).decode('utf-8')
+            else:
+                f_path = os.path.join(TEMP_DIR, f.name)
+                with open(f_path, "wb") as out_f:
+                    out_f.write(file_bytes)
+                file_paths.append(os.path.abspath(f_path))
 
     # Call Backend
     with st.chat_message("assistant"):
@@ -198,7 +207,7 @@ if prompt := st.chat_input("Ask about crops, soil, or pests..."):
                     "user_id": USER_ID,
                     "thread_id": st.session_state.thread_id,
                     "message": prompt,
-                    "file_path": file_path,
+                    "file_paths": file_paths, # Corrected to plural
                     "image_b64": image_b64,
                     "system_prompt": st.session_state.system_prompt
                 }
