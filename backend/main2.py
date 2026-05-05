@@ -16,6 +16,11 @@ from openai import OpenAI
 import models5 as models
 from database5 import engine, get_db
 
+import torch
+import chromadb
+from chromadb.config import Settings
+from sentence_transformers import SentenceTransformer
+
 # -------------------------------------------------
 # INIT
 # -------------------------------------------------
@@ -24,6 +29,117 @@ load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 models.Base.metadata.create_all(bind=engine)
+
+# -------------------------------------------------
+# LOCAL RAG CONFIG (ChromaDB + Sentence Transformers)
+# -------------------------------------------------
+
+MODEL_DIR = os.path.join(os.getcwd(), "embedding_models")
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+print("INFO: Loading local embedding model (all-MiniLM-L6-v2)...")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"INFO: Using device: {device}")
+
+# Load model locally
+embed_model = SentenceTransformer('all-MiniLM-L6-v2', device=device, cache_folder=MODEL_DIR)
+
+# Init ChromaDB
+CHROMA_PATH = os.path.join(os.getcwd(), "chroma_db")
+chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
+
+def get_user_history_collection(user_id: int):
+    """
+    Get or create a dedicated collection for a specific user to ensure physical isolation.
+    """
+    collection_name = f"user_history_{user_id}"
+    return chroma_client.get_or_create_collection(
+        name=collection_name,
+        metadata={"hnsw:space": "cosine"}
+    )
+
+def index_message_locally(user_id: int, thread_id: int, content: str, role: str):
+    """
+    Store message in ChromaDB for semantic retrieval.
+    Includes chunking for longer messages and thread tracking.
+    """
+    try:
+        # Simple Chunking: 500 chars with 50 overlap
+        chunk_size = 500
+        overlap = 50
+        #overlap = 100
+        chunks = []
+        
+        if len(content) <= chunk_size:
+            chunks = [content]
+        else:
+            # Basic sliding window chunking
+            start = 0
+            while start < len(content):
+                end = start + chunk_size
+                chunks.append(content[start:end])
+                start += (chunk_size - overlap)
+        
+        for i, chunk in enumerate(chunks):
+            # Manually generate embedding to ensure we use our GPU model and D: drive cache
+            chunk_emb = embed_model.encode([chunk]).tolist()
+            
+            # Get the user's specific collection
+            user_col = get_user_history_collection(user_id)
+            
+            msg_id = f"msg_{user_id}_{int(time.time() * 1000)}_{i}"
+            user_col.add(
+                embeddings=chunk_emb,
+                documents=[chunk],
+                metadatas=[{
+                    "user_id": user_id, 
+                    "thread_id": thread_id,
+                    "role": role, 
+                    "timestamp": str(datetime.datetime.now(datetime.timezone.utc)),
+                    "original_msg_id": f"{user_id}_{int(time.time())}"
+                }],
+                ids=[msg_id]   # msg_id is manuyally generated, can be done response_id from openai
+            )
+        print(f"DEBUG: Indexed {len(chunks)} local chunks for Thread {thread_id} (User {user_id}).")
+    except Exception as e:
+        print(f"DEBUG: Local indexing error: {e}")
+
+def retrieve_local_history(query: str, user_id: int, threshold: float = 0.35):
+    """
+    Semantic search over past messages
+    """
+    try:
+        query_emb = embed_model.encode([query]).tolist()
+        
+        # Get the user's specific collection
+        user_col = get_user_history_collection(user_id)
+        
+        # Max 5 chunks as requested
+        # We NO LONGER need the 'where' filter because this collection ONLY has this user's data
+        results = user_col.query(
+            query_embeddings=query_emb,
+            n_results=5
+        )
+        
+        relevant_chunks = []
+        if results['documents'] and len(results['documents'][0]) > 0:
+            print(f"DEBUG: Local Search found {len(results['documents'][0])} potential historical chunks.")
+            for i, doc in enumerate(results['documents'][0]):
+                distance = results['distances'][0][i]
+                similarity = 1 - distance
+                
+                if similarity >= threshold:
+                    meta = results['metadatas'][0][i]
+                    role = meta.get('role', 'unknown')
+                    tid = meta.get('thread_id', 'unknown')
+                    
+                    print(f"   - [LOCAL MATCH] Score: {similarity:.3f} | Thread: {tid} | {role}: {doc[:200]}...")
+                    relevant_chunks.append(f"[Local History - Thread {tid}] ({role}): {doc}")
+                    
+        return relevant_chunks
+    except Exception as e:
+        print(f"DEBUG: Local RAG error: {e}")
+        return []
 
 # -------------------------------------------------
 # CONFIG
@@ -103,10 +219,36 @@ def add_uploaded_file_to_store(file_path):
     # Attach to MASTER store
     vs_files = client.vector_stores.files.list(vector_store_id=MASTER_VECTOR_STORE_ID)
     if not any(f.id == file_id for f in vs_files.data):
-        client.vector_stores.file_batches.create_and_poll(
+        batch = client.vector_stores.file_batches.create_and_poll(
             vector_store_id=MASTER_VECTOR_STORE_ID,
             file_ids=[file_id]
         )
+
+        print("DEBUG: Batch processing completed.")
+
+        # EXTRA SAFETY CHECK
+        max_wait = 30
+        # reduce to 15
+        start = time.time()
+
+        while time.time() - start < max_wait:
+
+            vs_file = client.vector_stores.files.retrieve(
+                vector_store_id=MASTER_VECTOR_STORE_ID,
+                file_id=file_id
+            )
+
+            status = vs_file.status
+            print(f"DEBUG: File status = {status}")
+
+            if status == "completed":
+                print("DEBUG: File fully indexed and searchable.")
+                break
+
+            elif status == "failed":
+                raise Exception("Vector store indexing failed.")
+
+            time.sleep(2)
     return file_id
 
 # -------------------------------------------------
@@ -124,13 +266,14 @@ def retrieve_context(user_query: str):
     try:
         # Search the shared store
         print(f"DEBUG: Searching Shared Store for: '{user_query}'")
+        
         results = client.vector_stores.search(
             vector_store_id=MASTER_VECTOR_STORE_ID,
             query=user_query
         )
         if hasattr(results, "data"):
             print(f"DEBUG: Found {len(results.data)} raw chunks. Processing top 5...")
-            for i, r in enumerate(results.data[:5]):
+            for i, r in enumerate(results.data[:5]):   # top5 from master store
                 file_id = getattr(r, "file_id", None)
                 fname = get_filename(file_id)
                 chunk_text = r.content[0].text
@@ -157,7 +300,7 @@ async def lifespan(app: FastAPI):
     print(f"Server started with Shared Vector Store: {MASTER_VECTOR_STORE_ID}")
     yield
 
-app = FastAPI(title="AI Chat Microservice V5 - Simpler Shared Store", lifespan=lifespan)
+app = FastAPI(title="AI Chat Microservice V2 - Local RAG & Shared VS", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -244,6 +387,13 @@ def chat(chat_input: ChatInput, db: Session = Depends(get_db)):
 
     context = retrieve_context(chat_input.message)
 
+    # NEW: Local History Retrieval
+    print(f"DEBUG: Starting local history search for User {user.id}...")
+    local_history = retrieve_local_history(chat_input.message, user.id, threshold=0.35)
+    if local_history:
+        context += "\n\n[Relevant Past Context]\n" + "\n".join(local_history)
+        print(f"DEBUG: Found {len(local_history)} semantic matches from local history.")
+
     # History (Token-Based Limit: 1500 tokens)
     # Replaces the old count-based history:
     # history_messages = db.query(models.Message).filter(
@@ -257,6 +407,7 @@ def chat(chat_input: ChatInput, db: Session = Depends(get_db)):
     ).order_by(models.Message.timestamp.desc()).all()
     
     encoding = tiktoken.get_encoding("o200k_base")
+    # 1500 tokens limit for history context
     history_limit = 1500
     current_tokens = 0
     limited_history = []
@@ -278,13 +429,13 @@ def chat(chat_input: ChatInput, db: Session = Depends(get_db)):
 
     # Payload
     combined_prompt = f"""
-History:
+MEM:
 {history_str}
 
-Retrieved Knowledge:
+CTX:
 {context}
 
-Query:
+Q:
 {chat_input.message}
 """
     
@@ -303,6 +454,7 @@ Query:
             print("DEBUG: Image provided but no visual intent detected in query. Skipping image payload.")
 
     try:
+        print(f"DEBUG: Calling OpenAI Responses API (Model: gpt-4.1-mini)...")
         response = client.responses.create(
             model="gpt-4.1-mini",
             instructions=instructions,
@@ -312,6 +464,7 @@ Query:
             tools=[],
             input=[{"role": "user", "content": input_content}]
         )
+        print("DEBUG: OpenAI API call successful.")
         bot_reply = response.output_text
         response_id = response.id
         
@@ -319,6 +472,13 @@ Query:
         db.add(models.Message(thread_id=thread.id, role="user", content=chat_input.message))
         db.add(models.Message(thread_id=thread.id, role="assistant", content=bot_reply, response_id=response_id))
         db.commit()
+
+        # NEW: Index locally with thread awareness
+        # SAVE in local vectordb
+        index_message_locally(user.id, thread.id, chat_input.message, "user")
+        index_message_locally(user.id, thread.id, bot_reply, "assistant")
+
+        print(f"DEBUG: Final API Usage: {response.usage}")
 
         return {"reply": bot_reply, "thread_id": thread.id, "user_id": user.id}
     except Exception as e:
