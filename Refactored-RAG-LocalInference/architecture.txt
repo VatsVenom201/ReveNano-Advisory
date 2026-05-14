@@ -1,0 +1,7 @@
+main.py uses chat.py[chat with llm implementation] and ingest.py[ file loading->vectordb]
+
+user history - hybrid:
+         1) semantic search over past messages using local RAG [vector semantic search].
+         2) sliding window chunk sent to llm always - last 1500 tokens
+
+

@@ -1,0 +1,18 @@
+agri llms:
+
+1) llama 3.3 70b finetuned:
+   https://huggingface.co/AI71ai/Llama-agrillm-3.3-70B
+
+2)*qwen 3 30b finetuned
+   https://huggingface.co/AI71ai/agrillm-Qwen3-30B-A3B
+
+3)*AgriParam fintuned from Param 1-2.9B-Instruct
+   https://huggingface.co/bharatgenai/AgriParam
+
+4) KissanAI/ThinkingDhenu1-CRSA-India-preview finetune on Qwen 3-4b
+   https://huggingface.co/KissanAI/ThinkingDhenu1-CRSA-India-preview
+
+5) DARJYO AgriLLM GRPO finetune on unsloth/phi-4
+   https://huggingface.co/DARJYO/darjyo-AgriLLM-GRPO
+
+6) 
